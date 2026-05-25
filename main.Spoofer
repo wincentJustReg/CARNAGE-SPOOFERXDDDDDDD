@@ -1,0 +1,257 @@
+#include <windows.h>
+#include <winreg.h>
+#include <winioctl.h>
+#include <wbemidl.h>
+#include <comdef.h>
+#pragma comment(lib, "wbemuuid.lib")
+
+#include <string>
+#include <random>
+#include <fstream>
+#include <iostream>
+
+// ====================== Глобальные ======================
+HWND hMainWnd;
+HWND hLog;
+
+// ====================== Генераторы ======================
+std::string GenerateRandomString(int len) {
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<> dis(0, 15);
+    const char hex[] = "0123456789ABCDEF";
+    std::string s;
+    for (int i = 0; i < len; ++i) s += hex[dis(gen)];
+    return s;
+}
+
+std::string GenerateGUID() {
+    std::string guid = "{";
+    for (int i = 0; i < 36; ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) guid += '-';
+        else guid += GenerateRandomString(1);
+    }
+    guid += "}";
+    return guid;
+}
+
+// ====================== Логирование ======================
+void Log(const std::string& msg) {
+    SendMessageA(hLog, EM_SETSEL, -1, -1);
+    SendMessageA(hLog, EM_REPLACESEL, 0, (LPARAM)(msg + "\r\n").c_str());
+}
+
+// ====================== Админ ======================
+bool IsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+        DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin;
+}
+
+// ====================== Бэкап / Восстановление ======================
+bool BackupHWID() {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Microsoft\\Cryptography"), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        char buf[64] = {};
+        DWORD size = sizeof(buf);
+        if (RegQueryValueEx(hKey, TEXT("MachineGuid"), NULL, NULL, (LPBYTE)buf, &size) == ERROR_SUCCESS) {
+            std::ofstream f("hwid_backup.txt");
+            f << "=== HWID Backup ===\nMachineGuid=" << buf << "\nCreated: " << __DATE__ << " " << __TIME__ << "\n";
+            Log("[+] Бэкап создан: hwid_backup.txt");
+        }
+        RegCloseKey(hKey);
+        return true;
+    }
+    Log("[-] Не удалось создать бэкап");
+    return false;
+}
+
+bool RestoreHWID() {
+    std::ifstream f("hwid_backup.txt");
+    if (!f.is_open()) {
+        Log("[-] Файл бэкапа не найден!");
+        return false;
+    }
+    std::string line, guid;
+    while (std::getline(f, line)) {
+        if (line.find("MachineGuid=") != std::string::npos) {
+            guid = line.substr(12);
+            break;
+        }
+    }
+    if (guid.empty()) {
+        Log("[-] Оригинальный GUID не найден в бэкапе");
+        return false;
+    }
+
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Microsoft\\Cryptography"), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueEx(hKey, TEXT("MachineGuid"), 0, REG_SZ, (BYTE*)guid.c_str(), guid.size() + 1);
+        RegCloseKey(hKey);
+        Log("[+] MachineGuid восстановлен из бэкапа");
+        return true;
+    }
+    return false;
+}
+
+// ====================== Спуф функции ======================
+bool SpoofMachineGuid() {
+    std::string newGuid = GenerateGUID();
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Microsoft\\Cryptography"), 0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+        if (RegSetValueEx(hKey, TEXT("MachineGuid"), 0, REG_SZ, (BYTE*)newGuid.c_str(), newGuid.size() + 1) == ERROR_SUCCESS) {
+            Log("[+] MachineGuid изменён → " + newGuid);
+            RegCloseKey(hKey);
+            return true;
+        }
+        RegCloseKey(hKey);
+    }
+    Log("[-] Не удалось изменить MachineGuid");
+    return false;
+}
+
+bool SpoofVolumeSerial(const char* drive = "C:") {
+    std::string path = std::string("\\\\.\\") + drive;
+    HANDLE hVol = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hVol == INVALID_HANDLE_VALUE) {
+        Log("[-] Не удалось открыть том " + std::string(drive));
+        return false;
+    }
+
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    std::uniform_int_distribution<DWORD> dis(0x10000000, 0xEFFFFFFF);
+    DWORD serial = dis(gen);
+
+    DWORD bytes;
+    BOOL ok = DeviceIoControl(hVol, FSCTL_SET_VOLUME_SERIAL_NUMBER, &serial, sizeof(serial), NULL, 0, &bytes, NULL);
+    CloseHandle(hVol);
+
+    if (ok) Log("[+] Volume Serial (" + std::string(drive) + ") изменён");
+    else Log("[-] Не удалось изменить Volume Serial");
+    return ok;
+}
+
+bool SpoofMAC() {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+        TEXT("SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}"),
+        0, KEY_READ | KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        Log("[-] Не удалось открыть ключ сетевых адаптеров");
+        return false;
+    }
+
+    DWORD idx = 0;
+    char sub[256];
+    DWORD sz = 256;
+    bool changed = false;
+
+    while (RegEnumKeyExA(hKey, idx++, sub, &sz, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) {
+        HKEY hSub;
+        if (RegOpenKeyExA(hKey, sub, 0, KEY_READ | KEY_SET_VALUE, &hSub) == ERROR_SUCCESS) {
+            char desc[256] = {};
+            DWORD dsz = sizeof(desc);
+            if (RegQueryValueExA(hSub, "DriverDesc", NULL, NULL, (BYTE*)desc, &dsz) == ERROR_SUCCESS) {
+                std::string newMac = "02" + GenerateRandomString(10);
+                if (RegSetValueExA(hSub, "NetworkAddress", 0, REG_SZ, (BYTE*)newMac.c_str(), newMac.size() + 1) == ERROR_SUCCESS) {
+                    Log("[+] MAC изменён → " + newMac + " (" + desc + ")");
+                    changed = true;
+                }
+            }
+            RegCloseKey(hSub);
+        }
+        sz = 256;
+    }
+    RegCloseKey(hKey);
+    if (!changed) Log("[-] MAC не изменён (адаптеры не найдены)");
+    return changed;
+}
+
+// ====================== Показ текущих HWID (WMI) ======================
+void ShowCurrentHWID() {
+    Log("[*] Получение текущих HWID...");
+    // Простая реализация через WMI будет в следующей версии, если нужно
+    Log("MachineGuid: " + []() {
+        HKEY h; char b[64]={}; DWORD s=sizeof(b);
+        if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Microsoft\\Cryptography"), 0, KEY_READ, &h) == ERROR_SUCCESS) {
+            RegQueryValueEx(h, TEXT("MachineGuid"), NULL, NULL, (BYTE*)b, &s);
+            RegCloseKey(h);
+        }
+        return std::string(b);
+    }());
+}
+
+// ====================== Обработчик окон ======================
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_COMMAND:
+            switch (LOWORD(wp)) {
+                case 101: BackupHWID(); break;
+                case 102: 
+                    Log("=== Запуск полного спуфа ===");
+                    SpoofMachineGuid();
+                    SpoofVolumeSerial("C:");
+                    SpoofMAC();
+                    Log("=== Спуф завершён ===");
+                    break;
+                case 103: RestoreHWID(); break;
+                case 104: ShowCurrentHWID(); break;
+                case 105: DestroyWindow(hwnd); break;
+            }
+            break;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            break;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// ====================== WinMain ======================
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    if (!IsAdmin()) {
+        MessageBoxA(NULL, "Программа должна быть запущена от имени администратора!", "Ошибка", MB_ICONERROR);
+        return 1;
+    }
+
+    const char CLASS[] = "HWIDSpoofer";
+
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = CLASS;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+
+    RegisterClassA(&wc);
+
+    hMainWnd = CreateWindowA(CLASS, "Educational HWID Spoofer v2.0 - GUI", 
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        100, 100, 800, 620, NULL, NULL, hInst, NULL);
+
+    // Кнопки
+    CreateWindowA("BUTTON", "1. Создать Backup", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 20, 20, 220, 45, hMainWnd, (HMENU)101, hInst, NULL);
+    CreateWindowA("BUTTON", "2. SPOOF ALL", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 20, 80, 220, 60, hMainWnd, (HMENU)102, hInst, NULL);
+    CreateWindowA("BUTTON", "3. Restore из Backup", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 20, 155, 220, 45, hMainWnd, (HMENU)103, hInst, NULL);
+    CreateWindowA("BUTTON", "4. Показать текущие HWID", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 20, 215, 220, 45, hMainWnd, (HMENU)104, hInst, NULL);
+    CreateWindowA("BUTTON", "Выход", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 20, 520, 220, 45, hMainWnd, (HMENU)105, hInst, NULL);
+
+    // Лог
+    hLog = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+                        260, 20, 510, 545, hMainWnd, NULL, hInst, NULL);
+
+    Log("=== Educational HWID Spoofer GUI ===");
+    Log("Запущен от имени администратора.");
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return 0;
+}
