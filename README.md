@@ -1,6 +1,6 @@
 <div id="header" align="center">
-  <img src="https://media.giphy.com/media/M9gbBd9nbDrOTu1Mqx/giphy.gif" width="100"/>
-# CARNAGE-SPOOFERXDDDDDDD
+  <img src="https://media1.tenor.com/m/92MplgQwb80AAAAC/cat-meme-wave-emoji.gif" width="200"/>
+CARNAGE-SPOOFERXDDDDDDD
 КАААРОЧЕ, я щас спуфер ебану, мб чота получится, узнаем? Стек плюсы, работает над kernel, наверное хуево, но я тут чтобы это узнать. 
   так, представим что тут что-то есть, читаем с умными глазами. 
 
